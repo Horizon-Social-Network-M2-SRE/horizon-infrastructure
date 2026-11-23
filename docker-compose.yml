@@ -1,0 +1,106 @@
+# Horizon local stack (S1-09): gateway -> web + api, MongoDB, Redis.
+# Usage: make up | make up-local | make test   (or: bash scripts/stack.sh <command>)
+#
+# The browser only talks to the gateway (http://localhost:8080), like the Traefik ingress in
+# Kubernetes: / goes to web, /api/* to the api with /api stripped, /ws to the api.
+# Only the gateway publishes a host port; debug the data stores with `docker compose exec`.
+
+name: horizon
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+
+services:
+  mongo:
+    <<: *hardening
+    image: mongo:7.0
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    <<: *hardening
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    <<: *hardening
+    image: ${API_IMAGE:-ghcr.io/horizon-social-network-m2-sre/horizon-backend:main}
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      MONGODB_URI: mongodb://mongo:27017
+      MONGODB_DB: horizon
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is not set - run 'make env'}
+      # The browser sees the api under /api, so the refresh cookie path must include it.
+      REFRESH_COOKIE_PATH: /api/auth
+      # Trust X-Forwarded-* from the gateway (the api has no host port, only the gateway reaches it).
+      FORWARDED_ALLOW_IPS: "*"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Readiness: answers 200 only when MongoDB and Redis are reachable.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2).status == 200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  web:
+    <<: *hardening
+    image: ${WEB_IMAGE:-ghcr.io/horizon-social-network-m2-sre/horizon-web:main}
+    profiles: ["web"]  # enabled with COMPOSE_PROFILES=web once horizon-web has a Dockerfile (S1-10)
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: /api
+    depends_on:
+      api:
+        condition: service_healthy
+
+  gateway:
+    <<: *hardening
+    image: traefik:v3.2
+    command:
+      - --entrypoints.web.address=:80
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --ping=true
+      - --accesslog=true
+      - --metrics.prometheus=true
+    volumes:
+      - ./compose/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  mongo-data:
+  redis-data:

@@ -1,0 +1,37 @@
+# Gateway routes, same shape as the Kubernetes Ingress (plan v6, section 6):
+#   /api/*  -> api, with /api stripped (the api serves /auth, /users, /health, ...)
+#   /ws     -> api (WebSocket, S3-04)
+#   /       -> web
+http:
+  routers:
+    api:
+      rule: "PathPrefix(`/api`)"
+      entryPoints: [web]
+      middlewares: [strip-api]
+      service: api
+      priority: 100
+    ws:
+      rule: "PathPrefix(`/ws`)"
+      entryPoints: [web]
+      service: api
+      priority: 90
+    web:
+      rule: "PathPrefix(`/`)"
+      entryPoints: [web]
+      service: web
+      priority: 1
+
+  middlewares:
+    strip-api:
+      stripPrefix:
+        prefixes: ["/api"]
+
+  services:
+    api:
+      loadBalancer:
+        servers:
+          - url: "http://api:8000"
+    web:
+      loadBalancer:
+        servers:
+          - url: "http://web:3000"

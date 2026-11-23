@@ -1,0 +1,12 @@
+# Override for `make up-local`: build api (and web) from local checkouts instead of pulling
+# images from GHCR. Paths come from BACKEND_DIR / WEB_DIR in .env.
+services:
+  api:
+    image: horizon-backend:local
+    build:
+      context: ${BACKEND_DIR:-../horizon-backend}
+
+  web:
+    image: horizon-web:local
+    build:
+      context: ${WEB_DIR:-../horizon-web}

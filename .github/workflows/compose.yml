@@ -1,0 +1,57 @@
+name: compose
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Compose files and scripts are valid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose config
+        env:
+          JWT_SECRET: ci-only-validation-secret-0123456789abcdef
+        run: |
+          docker compose config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.build.yml config --quiet
+          COMPOSE_PROFILES=web docker compose config --quiet
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+
+  e2e:
+    name: Stack starts and smoke tests pass
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: horizon-infrastructure
+      - uses: actions/checkout@v4
+        with:
+          repository: Horizon-Social-Network-M2-SRE/horizon-backend
+          ref: main
+          path: horizon-backend
+      - name: Check the backend has a Dockerfile yet
+        id: backend
+        run: |
+          if [ -f horizon-backend/Dockerfile ]; then echo "ready=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::horizon-backend main has no Dockerfile yet (S1-04 not merged); skipping e2e"; fi
+      - name: Start the stack from the backend checkout
+        if: steps.backend.outputs.ready == 'true'
+        working-directory: horizon-infrastructure
+        run: bash scripts/stack.sh up-local
+      - name: Smoke tests
+        if: steps.backend.outputs.ready == 'true'
+        working-directory: horizon-infrastructure
+        run: bash scripts/stack.sh test
+      - name: Logs on failure
+        if: failure()
+        working-directory: horizon-infrastructure
+        run: docker compose logs --tail=200

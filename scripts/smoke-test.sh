@@ -36,7 +36,9 @@ SMOKE_DATA='username=nobody%40horizon.test&password=wrong-password' \
 check "login rejects unknown user"       401 POST /api/auth/login
 
 if docker compose ps --services --status running 2>/dev/null | grep -qx web; then
-  check "web served on /"                200 GET  /
+  check "web redirects / to sign-in"     307 GET  /
+  check "web serves the sign-in page"    200 GET  /login 'Sign in'
+  check "web serves the register page"   200 GET  /register 'Create account'
 else
   echo "skip web served on / (web profile not running; S1-10)"
 fi

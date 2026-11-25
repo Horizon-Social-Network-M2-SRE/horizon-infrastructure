@@ -38,17 +38,15 @@ jobs:
           repository: Horizon-Social-Network-M2-SRE/horizon-backend
           ref: main
           path: horizon-backend
-      - name: Check the backend has a Dockerfile yet
-        id: backend
+      - name: Backend has a Dockerfile
         run: |
-          if [ -f horizon-backend/Dockerfile ]; then echo "ready=true" >> "$GITHUB_OUTPUT"
-          else echo "::notice::horizon-backend main has no Dockerfile yet (S1-04 not merged); skipping e2e"; fi
+          if [ ! -f horizon-backend/Dockerfile ]; then
+            echo "::error::horizon-backend main has no Dockerfile; the stack cannot be built"; exit 1
+          fi
       - name: Start the stack from the backend checkout
-        if: steps.backend.outputs.ready == 'true'
         working-directory: horizon-infrastructure
         run: bash scripts/stack.sh up-local
       - name: Smoke tests
-        if: steps.backend.outputs.ready == 'true'
         working-directory: horizon-infrastructure
         run: bash scripts/stack.sh test
       - name: Logs on failure

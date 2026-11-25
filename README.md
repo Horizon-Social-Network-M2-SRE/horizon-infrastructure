@@ -24,7 +24,9 @@ The first run creates `.env` from `.env.example` with a random `JWT_SECRET`. `.e
 | http://localhost:8080/api/... | api, with `/api` stripped (`/api/health` → `/health`) |
 | http://localhost:8080/ws | api WebSocket (S3) |
 
-Only the gateway publishes a port (`GATEWAY_PORT` in `.env` if 8080 is taken). Debug the data
+Only the gateway publishes a port. **If 8080 is already used** (Jenkins, another proxy...), set
+`GATEWAY_PORT=8081` (or any free port) in `.env`, then `make down && make up`: otherwise the
+gateway cannot bind and `make test` stops with "gateway container is not running". Debug the data
 stores with `docker compose exec mongo mongosh` or `docker compose exec redis redis-cli`.
 
 The gateway is Traefik with the same routes as the Kubernetes Ingress, so the refresh cookie
@@ -44,9 +46,10 @@ then `make up-local`. Until the S1-02 workflows publish images to GHCR, use `mak
 
 `scripts/smoke-test.sh` checks, through the gateway: api liveness and readiness (MongoDB + Redis),
 prefix stripping, `/metrics`, a protected route returning 401, login rejecting an unknown user,
-and `/` once the web app runs.
+and `/` once the web app runs. It refuses to run if this stack's `gateway` container is not up
+(set `BASE_URL` to test another gateway).
 
 ## CI
 
 `.github/workflows/compose.yml` validates the Compose files and scripts, then starts the stack
-from `horizon-backend` `main` and runs the smoke tests (skipped until the backend has a Dockerfile).
+from `horizon-backend` `main` and runs the smoke tests. The job fails if the backend has no Dockerfile.

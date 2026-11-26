@@ -73,8 +73,8 @@ services:
     <<: *hardening
     image: ${WEB_IMAGE:-ghcr.io/horizon-social-network-m2-sre/horizon-web:main}
     profiles: ["web"]  # enabled with COMPOSE_PROFILES=web once horizon-web has a Dockerfile (S1-10)
-    environment:
-      NEXT_PUBLIC_API_BASE_URL: /api
+    # The browser calls /api on the same origin (the client default); NEXT_PUBLIC_* values are
+    # inlined at build time, so there is nothing to set at runtime.
     depends_on:
       api:
         condition: service_healthy

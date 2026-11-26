@@ -39,8 +39,13 @@ case "${1:-help}" in
   env) cmd_env ;;
   up)
     cmd_env
-    compose pull --ignore-pull-failures
-    compose up -d --wait
+    if ! compose pull --ignore-pull-failures; then
+      echo "Pulling the images failed. If they are not public on GHCR yet (S1-02), use: bash scripts/stack.sh up-local" >&2
+    fi
+    if ! compose up -d --wait; then
+      echo "Start failed. If the images are missing or private on GHCR, use: bash scripts/stack.sh up-local" >&2
+      exit 1
+    fi
     echo "Stack ready: $(gateway_url)  (api: /api/health)"
     ;;
   up-local)

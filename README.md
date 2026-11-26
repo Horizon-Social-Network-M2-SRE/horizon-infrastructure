@@ -16,6 +16,18 @@ make clean       # also deletes the MongoDB/Redis volumes of this stack
 
 No `make` (e.g. Windows)? Every target works with `bash scripts/stack.sh <target>` (Git Bash).
 
+`make up-local` expects the repositories **side by side**, in the same parent folder:
+
+```text
+horizon/
+├── horizon-infrastructure/   ← you are here
+├── horizon-backend/
+└── horizon-web/
+```
+
+Elsewhere? Set `BACKEND_DIR` and `WEB_DIR` in `.env`. If `make up` fails with a 403 from GHCR, the
+images are not public yet: use `make up-local`.
+
 The first run creates `.env` from `.env.example` with a random `JWT_SECRET`. `.env` is git-ignored.
 
 | URL | Goes to |

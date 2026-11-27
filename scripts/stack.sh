@@ -54,12 +54,12 @@ case "${1:-help}" in
     echo "Stack ready (local build): $(gateway_url)"
     ;;
   test) bash scripts/smoke-test.sh ;;
-  down) compose down ;;
+  down) compose --profile "*" down ;;
   logs) compose logs -f --tail=100 ;;
   ps) compose ps ;;
   clean)
     # Removes the containers AND the MongoDB/Redis volumes of this stack only.
-    compose down --volumes --remove-orphans
+    compose --profile "*" down --volumes --remove-orphans
     ;;
   *)
     sed -n '2,8p' "$0"

@@ -150,6 +150,10 @@ jobs:
       contains(fromJSON('["success", "skipped"]'), needs.build.result)
     needs: [lint, test, build, secrets]
     runs-on: ubuntu-latest
+    # One image job per branch at a time, newest queued last: :main never ends on an older commit.
+    concurrency:
+      group: image-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write

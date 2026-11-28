@@ -1,0 +1,247 @@
+name: node-ci
+
+# Reusable CI for Node.js apps (S1-02): npm lint, test and build, gitleaks, then an image that is
+# built, scanned with Trivy and pushed to GHCR. Usage and inputs: README.md, "Reusable CI workflows".
+#
+#   jobs:
+#     ci:
+#       uses: Horizon-Social-Network-M2-SRE/horizon-infrastructure/.github/workflows/node-ci.yml@main
+#       permissions: { contents: read, packages: write }
+#
+# Needs package-lock.json (npm ci). The image is pushed only on a push to the default branch, after
+# every other job passed, as ghcr.io/<owner>/<repo>:sha-<commit> and :<branch>.
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory holding package.json and the Dockerfile
+        type: string
+        default: "."
+      node-version:
+        type: string
+        default: "22"
+      lint-script:
+        description: npm script that lints (required to exist; empty = skip lint)
+        type: string
+        default: lint
+      test-script:
+        description: npm script that runs the tests (a warning, not a failure, while it does not exist)
+        type: string
+        default: test
+      build-script:
+        description: npm script that builds (required to exist; empty = skip build)
+        type: string
+        default: build
+      image:
+        description: Build, scan and publish a container image from the Dockerfile
+        type: boolean
+        default: true
+      image-name:
+        description: Image name under ghcr.io/<owner>/ (default the repository name)
+        type: string
+        default: ""
+      dockerfile:
+        description: Dockerfile path, relative to working-directory
+        type: string
+        default: Dockerfile
+      push:
+        description: Push the image on the default branch (never on pull requests)
+        type: boolean
+        default: true
+      trivy-severity:
+        description: Severities that fail the scan (only vulnerabilities with a fix)
+        type: string
+        default: CRITICAL,HIGH
+    outputs:
+      image:
+        description: Image reference without tag, e.g. ghcr.io/owner/repo
+        value: ${{ jobs.image.outputs.image }}
+      tag:
+        description: Immutable tag pushed, sha-<commit> (empty when nothing was pushed)
+        value: ${{ jobs.image.outputs.tag }}
+      digest:
+        description: Pushed image digest, image@sha256:... (empty when nothing was pushed)
+        value: ${{ jobs.image.outputs.digest }}
+
+jobs:
+  lint:
+    name: lint
+    if: inputs.lint-script != ''
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+      - run: npm ci
+      - name: npm run ${{ inputs.lint-script }}
+        env:
+          SCRIPT: ${{ inputs.lint-script }}
+        run: npm run "$SCRIPT"
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+      - run: npm ci
+      - name: npm run ${{ inputs.test-script }}
+        env:
+          SCRIPT: ${{ inputs.test-script }}
+        run: |
+          if [ -z "$SCRIPT" ] || ! npm pkg get "scripts.$SCRIPT" | grep -q '"'; then
+            echo "::warning::no '$SCRIPT' script in package.json: no tests ran"
+            exit 0
+          fi
+          npm run "$SCRIPT"
+
+  build:
+    name: build
+    if: inputs.build-script != ''
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+      - run: npm ci
+      - name: npm run ${{ inputs.build-script }}
+        env:
+          SCRIPT: ${{ inputs.build-script }}
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: npm run "$SCRIPT"
+
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # the whole history: a secret removed later is still leaked
+      - name: gitleaks
+        # Honours .gitleaks.toml and .gitleaksignore at the repository root.
+        run: docker run --rm -v "$PWD:/repo" "$GITLEAKS_IMAGE" git /repo --redact --no-banner --exit-code 1
+
+  image:
+    name: image
+    # Skipped optional jobs (lint, build) do not block the image; failed ones do.
+    if: |
+      !cancelled() && inputs.image &&
+      needs.test.result == 'success' && needs.secrets.result == 'success' &&
+      contains(fromJSON('["success", "skipped"]'), needs.lint.result) &&
+      contains(fromJSON('["success", "skipped"]'), needs.build.result)
+    needs: [lint, test, build, secrets]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.push.outputs.tag }}
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      PUSH: ${{ inputs.push && github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Image name and tags
+        id: meta
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          name="${IMAGE_NAME:-${GITHUB_REPOSITORY#*/}}"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${name,,}"  # registry names are lowercase
+          branch="$(echo "$GITHUB_REF_NAME" | tr -c 'a-zA-Z0-9_.\n-' '-')"
+          {
+            echo "image=$image"
+            echo "sha-tag=$image:sha-$GITHUB_SHA"
+            echo "branch-tag=$image:$branch"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          SHA_TAG: ${{ steps.meta.outputs.sha-tag }}
+          BRANCH_TAG: ${{ steps.meta.outputs.branch-tag }}
+        # The source label links the GHCR package to this repository (and its GITHUB_TOKEN).
+        run: |
+          docker build --pull -f "$DOCKERFILE" -t "$SHA_TAG" -t "$BRANCH_TAG" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            .
+
+      - name: Day of the Trivy database
+        id: day
+        run: echo "day=$(date -u +%Y-%m-%d)" >>"$GITHUB_OUTPUT"
+
+      - name: Trivy database cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/trivy-cache
+          key: trivy-db-${{ steps.day.outputs.day }}
+          restore-keys: trivy-db-
+
+      - name: Trivy scan
+        env:
+          SHA_TAG: ${{ steps.meta.outputs.sha-tag }}
+          SEVERITY: ${{ inputs.trivy-severity }}
+        # Fails on fixable vulnerabilities only; accepted ones go in .trivyignore with a reason.
+        run: |
+          ignore=()
+          if [ -f .trivyignore ]; then ignore=(-v "$PWD/.trivyignore:/.trivyignore:ro" --env TRIVY_IGNOREFILE=/.trivyignore); fi
+          mkdir -p "$RUNNER_TEMP/trivy-cache"
+          docker run --rm "${ignore[@]}" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" image --no-progress --scanners vuln \
+            --severity "$SEVERITY" --ignore-unfixed --exit-code 1 "$SHA_TAG"
+
+      - name: Push to GHCR
+        id: push
+        if: env.PUSH == 'true'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          SHA_TAG: ${{ steps.meta.outputs.sha-tag }}
+          BRANCH_TAG: ${{ steps.meta.outputs.branch-tag }}
+          GH_TOKEN: ${{ github.token }}
+        # Pushes the image that was scanned, not a rebuild.
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$SHA_TAG"
+          docker push "$BRANCH_TAG"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$SHA_TAG")"
+          echo "tag=sha-$GITHUB_SHA" >>"$GITHUB_OUTPUT"
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+          {
+            echo "### Image pushed"
+            echo "- \`$SHA_TAG\`"
+            echo "- \`$BRANCH_TAG\`"
+            echo "- \`$digest\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+          docker logout ghcr.io
+
+      - name: Not pushed
+        if: env.PUSH != 'true'
+        run: echo "Built and scanned; pushed only on a push to the default branch." >>"$GITHUB_STEP_SUMMARY"

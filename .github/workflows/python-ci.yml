@@ -1,0 +1,264 @@
+name: python-ci
+
+# Reusable CI for Python services (S1-02): ruff, pytest, gitleaks, then an image that is built,
+# scanned with Trivy and pushed to GHCR. Usage and inputs: README.md, "Reusable CI workflows".
+#
+#   jobs:
+#     ci:
+#       uses: Horizon-Social-Network-M2-SRE/horizon-infrastructure/.github/workflows/python-ci.yml@main
+#       permissions: { contents: read, packages: write }
+#       with:
+#         mongo-image: mongo:7
+#         redis-image: redis:7
+#
+# The image is pushed only on a push to the default branch, after every other job passed, as
+# ghcr.io/<owner>/<repo>:sha-<commit> and :<branch>. Pull requests build and scan it, never push.
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory holding pyproject.toml and the Dockerfile
+        type: string
+        default: "."
+      python-version:
+        type: string
+        default: "3.13"
+      install-command:
+        description: Installs the project and its test dependencies
+        type: string
+        default: pip install -e '.[dev]'
+      ruff-version:
+        description: ruff release used for lint and format (rules come from the repository's own config)
+        type: string
+        default: "0.17.6"
+      ruff-format:
+        description: Also fail when `ruff format --check` would reformat files
+        type: boolean
+        default: true
+      pytest-args:
+        type: string
+        default: "-ra"
+      mongo-image:
+        description: MongoDB service for the tests (empty = none). Exposes TEST_MONGODB_URI
+        type: string
+        default: ""
+      redis-image:
+        description: Redis service for the tests (empty = none). Exposes TEST_REDIS_URL
+        type: string
+        default: ""
+      image:
+        description: Build, scan and publish a container image from the Dockerfile
+        type: boolean
+        default: true
+      image-name:
+        description: Image name under ghcr.io/<owner>/ (default the repository name)
+        type: string
+        default: ""
+      dockerfile:
+        description: Dockerfile path, relative to working-directory
+        type: string
+        default: Dockerfile
+      push:
+        description: Push the image on the default branch (never on pull requests)
+        type: boolean
+        default: true
+      trivy-severity:
+        description: Severities that fail the scan (only vulnerabilities with a fix)
+        type: string
+        default: CRITICAL,HIGH
+    outputs:
+      image:
+        description: Image reference without tag, e.g. ghcr.io/owner/repo
+        value: ${{ jobs.image.outputs.image }}
+      tag:
+        description: Immutable tag pushed, sha-<commit> (empty when nothing was pushed)
+        value: ${{ jobs.image.outputs.tag }}
+      digest:
+        description: Pushed image digest, image@sha256:... (empty when nothing was pushed)
+        value: ${{ jobs.image.outputs.digest }}
+
+permissions:
+  contents: read
+
+env:
+  # Pinned by version and digest: these run with the Docker socket or the repository history.
+  GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install ruff
+        env:
+          RUFF_VERSION: ${{ inputs.ruff-version }}
+        run: pip install "ruff==${RUFF_VERSION}"
+      - name: ruff check
+        run: ruff check --output-format=github .
+      - name: ruff format --check
+        if: inputs.ruff-format
+        run: ruff format --check --diff .
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    # An empty image skips the service, so callers without MongoDB or Redis pay nothing.
+    services:
+      mongo:
+        image: ${{ inputs.mongo-image }}
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1})'"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: ${{ inputs.redis-image }}
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_MONGODB_URI: ${{ inputs.mongo-image != '' && 'mongodb://localhost:27017' || '' }}
+      TEST_REDIS_URL: ${{ inputs.redis-image != '' && 'redis://localhost:6379/15' || '' }}
+      # With a service configured, tests that need it must fail when it is down, not skip.
+      REQUIRE_SERVICES: ${{ (inputs.mongo-image != '' || inputs.redis-image != '') && '1' || '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.working-directory }}/pyproject.toml
+      - name: Install
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+        run: bash -c "$INSTALL_COMMAND"
+      - name: pytest
+        env:
+          PYTEST_ARGS: ${{ inputs.pytest-args }}
+        run: |
+          # Word splitting is wanted: PYTEST_ARGS holds several arguments.
+          # shellcheck disable=SC2086
+          python -m pytest $PYTEST_ARGS
+
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # the whole history: a secret removed later is still leaked
+      - name: gitleaks
+        # Honours .gitleaks.toml and .gitleaksignore at the repository root.
+        run: docker run --rm -v "$PWD:/repo" "$GITLEAKS_IMAGE" git /repo --redact --no-banner --exit-code 1
+
+  image:
+    name: image
+    if: inputs.image
+    needs: [lint, test, secrets]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.push.outputs.tag }}
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      PUSH: ${{ inputs.push && github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Image name and tags
+        id: meta
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          name="${IMAGE_NAME:-${GITHUB_REPOSITORY#*/}}"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${name,,}"  # registry names are lowercase
+          branch="$(echo "$GITHUB_REF_NAME" | tr -c 'a-zA-Z0-9_.\n-' '-')"
+          {
+            echo "image=$image"
+            echo "sha-tag=$image:sha-$GITHUB_SHA"
+            echo "branch-tag=$image:$branch"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          SHA_TAG: ${{ steps.meta.outputs.sha-tag }}
+          BRANCH_TAG: ${{ steps.meta.outputs.branch-tag }}
+        # The source label links the GHCR package to this repository (and its GITHUB_TOKEN).
+        run: |
+          docker build --pull -f "$DOCKERFILE" -t "$SHA_TAG" -t "$BRANCH_TAG" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            .
+
+      - name: Day of the Trivy database
+        id: day
+        run: echo "day=$(date -u +%Y-%m-%d)" >>"$GITHUB_OUTPUT"
+
+      - name: Trivy database cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/trivy-cache
+          key: trivy-db-${{ steps.day.outputs.day }}
+          restore-keys: trivy-db-
+
+      - name: Trivy scan
+        env:
+          SHA_TAG: ${{ steps.meta.outputs.sha-tag }}
+          SEVERITY: ${{ inputs.trivy-severity }}
+        # Fails on fixable vulnerabilities only; accepted ones go in .trivyignore with a reason.
+        run: |
+          ignore=()
+          if [ -f .trivyignore ]; then ignore=(-v "$PWD/.trivyignore:/.trivyignore:ro" --env TRIVY_IGNOREFILE=/.trivyignore); fi
+          mkdir -p "$RUNNER_TEMP/trivy-cache"
+          docker run --rm "${ignore[@]}" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" image --no-progress --scanners vuln \
+            --severity "$SEVERITY" --ignore-unfixed --exit-code 1 "$SHA_TAG"
+
+      - name: Push to GHCR
+        id: push
+        if: env.PUSH == 'true'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          SHA_TAG: ${{ steps.meta.outputs.sha-tag }}
+          BRANCH_TAG: ${{ steps.meta.outputs.branch-tag }}
+          GH_TOKEN: ${{ github.token }}
+        # Pushes the image that was scanned, not a rebuild.
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$SHA_TAG"
+          docker push "$BRANCH_TAG"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$SHA_TAG")"
+          echo "tag=sha-$GITHUB_SHA" >>"$GITHUB_OUTPUT"
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+          {
+            echo "### Image pushed"
+            echo "- \`$SHA_TAG\`"
+            echo "- \`$BRANCH_TAG\`"
+            echo "- \`$digest\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+          docker logout ghcr.io
+
+      - name: Not pushed
+        if: env.PUSH != 'true'
+        run: echo "Built and scanned; pushed only on a push to the default branch." >>"$GITHUB_STEP_SUMMARY"

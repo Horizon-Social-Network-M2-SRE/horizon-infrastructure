@@ -1,0 +1,49 @@
+name: reusable-ci
+
+# Proves the reusable workflows of this commit work before the other repositories call them:
+# actionlint on every workflow, then python-ci.yml and node-ci.yml against the fixtures in
+# tests/fixtures (lint, tests with a Redis service, build, gitleaks, image build and Trivy scan).
+# The fixtures never push an image.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: actionlint (with shellcheck)
+        run: >
+          docker run --rm -v "$PWD:/repo" -w /repo
+          rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+          -color
+
+  python:
+    needs: actionlint
+    uses: ./.github/workflows/python-ci.yml
+    permissions:
+      contents: read
+      packages: write  # requested by the image job; push: false keeps it unused
+    with:
+      working-directory: tests/fixtures/python-app
+      redis-image: redis:7.4-alpine
+      image-name: reusable-ci-python-fixture
+      push: false
+
+  node:
+    needs: actionlint
+    uses: ./.github/workflows/node-ci.yml
+    permissions:
+      contents: read
+      packages: write  # requested by the image job; push: false keeps it unused
+    with:
+      working-directory: tests/fixtures/node-app
+      image-name: reusable-ci-node-fixture
+      push: false
